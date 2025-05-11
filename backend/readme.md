@@ -1,5 +1,5 @@
 
-# MySQL Cluster Manager 🐬🚀
+# Distributed Database System 🐬🚀
 
 This project implements a **MySQL cluster management system** using **Go**. It supports **Master-Slave replication**, automatic **failover**, **CRUD operations**, and **cluster monitoring** through RESTful APIs. This system is ideal for managing and replicating MySQL databases across multiple nodes in real-time.
 
