@@ -166,9 +166,9 @@ This project is a **project** for the **Distributed Database** course. It was 
 
 ![DDB-management.jpg](./backend/DDB%20management.jpg)
 
-![Fault-tolerance.jpg](./backend/Fault-tolerance.jpg)
+![Fault-tolerance.jpg](./backend/Fault%20tolerance.jpg)
 
-![Fault-tolerance.mp4](./backend/Fault-tolerance.mp4)
+![Fault-tolerance.mp4](./backend/Fault%20tolerance.mp4)
 
 ---
 
