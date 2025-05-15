@@ -162,11 +162,9 @@ This project is a **project** for the **Distributed Database** course. It was 
 
 ---
 
----
-
 ## Architecture
 
-![DDB-management.jpg](./backend/DDB-management.jpg)
+![DDB-management.jpg](./backend/DDB%20management.jpg)
 
 ![Fault-tolerance.jpg](./backend/Fault-tolerance.jpg)
 
