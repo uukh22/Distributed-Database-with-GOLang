@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Network, Server, CheckCircle2, XCircle, RefreshCw } from "lucide-react"
+import { Network, Server, CheckCircle2, XCircle, RefreshCw, Database } from "lucide-react"
 
 import { apiService, type Node } from "@/lib/api-service"
 import { Button } from "@/components/ui/button"
@@ -270,14 +270,22 @@ export default function ClusterPage() {
             ) : (
               <div className="grid gap-6 md:grid-cols-3">
                 {Array.from(new Set(nodes.map((node) => node.shardId)))
-                  .sort()
+                  .sort((a, b) => a - b) // Sort numerically
                   .map((shardId) => {
                     const shardNodes = nodes.filter((node) => node.shardId === shardId)
+                    const hasMaster = shardNodes.some((node) => node.role === "master")
+                    const healthyNodes = shardNodes.filter((node) => node.isHealthy).length
+
                     return (
-                      <Card key={shardId}>
+                      <Card key={shardId} className={hasMaster ? "border-primary" : ""}>
                         <CardHeader className="pb-2">
-                          <CardTitle className="text-lg">Shard {shardId}</CardTitle>
-                          <CardDescription>{shardNodes.length} nodes</CardDescription>
+                          <CardTitle className="text-lg flex items-center justify-between">
+                            <span>Shard {shardId}</span>
+                            {hasMaster && <Database className="h-4 w-4 text-primary" />}
+                          </CardTitle>
+                          <CardDescription>
+                            {shardNodes.length} nodes • {healthyNodes} healthy
+                          </CardDescription>
                         </CardHeader>
                         <CardContent>
                           <div className="space-y-2">

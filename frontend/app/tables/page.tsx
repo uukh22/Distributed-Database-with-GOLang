@@ -112,6 +112,7 @@ export default function TablesPage() {
     }
   }
 
+  // Update the createTable function to handle the new API structure
   const handleCreateTable = async () => {
     if (!dbName) return
 
@@ -143,7 +144,10 @@ export default function TablesPage() {
     })
 
     try {
-      const response = await apiService.createTable(dbName, newTableName, columnsObj)
+      // Calculate a shardId for the table based on dbName and tableName
+      const shardId = Math.floor(Math.random() * 3) // Simple random shard assignment (0-2)
+
+      const response = await apiService.createTable(dbName, newTableName, columnsObj, shardId)
       if (response.success) {
         toast({
           title: "Success",
@@ -272,24 +276,26 @@ export default function TablesPage() {
             </div>
           </div>
 
-          {nodeRole === "slave" ? (
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">
-                This is a slave node. Write operations must be performed on the master.
-              </span>
-              {masterUrl && (
-                <Button variant="outline" size="sm" asChild>
-                  <a href={`${masterUrl}/tables?db=${dbName}`} target="_blank" rel="noopener noreferrer">
-                    Go to Master
-                  </a>
-                </Button>
-              )}
-            </div>
-          ) : (
+          <div className="flex items-center gap-2">
+            {nodeRole === "slave" && (
+              <div className="flex items-center mr-4">
+                <span className="text-sm text-muted-foreground mr-2">
+                  Slave node: Table management is only available on master node.
+                </span>
+                {masterUrl && (
+                  <Button variant="outline" size="sm" asChild>
+                    <a href={`${masterUrl}/tables?db=${dbName}`} target="_blank" rel="noopener noreferrer">
+                      Go to Master
+                    </a>
+                  </Button>
+                )}
+              </div>
+            )}
+
             <div className="flex gap-2">
               <Dialog open={linkDialogOpen} onOpenChange={setLinkDialogOpen}>
                 <DialogTrigger asChild>
-                  <Button variant="outline">
+                  <Button variant="outline" disabled={nodeRole === "slave"}>
                     <LinkIcon className="mr-2 h-4 w-4" />
                     Link Tables
                   </Button>
@@ -398,7 +404,7 @@ export default function TablesPage() {
 
               <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
                 <DialogTrigger asChild>
-                  <Button>
+                  <Button disabled={nodeRole === "slave"}>
                     <Plus className="mr-2 h-4 w-4" />
                     Create Table
                   </Button>
@@ -466,7 +472,7 @@ export default function TablesPage() {
                 </DialogContent>
               </Dialog>
             </div>
-          )}
+          </div>
         </div>
 
         {loading ? (
@@ -492,7 +498,10 @@ export default function TablesPage() {
                     <Table2 className="h-5 w-5" />
                     <span>{table.name}</span>
                   </CardTitle>
-                  <CardDescription>{table.columns.length} columns</CardDescription>
+                  <CardDescription>
+                    {table.columns.length} columns • Shard {table.shardId}
+                    {table.shardKey && ` • Shard Key: ${table.shardKey}`}
+                  </CardDescription>
                 </CardHeader>
                 <CardContent>
                   <Tabs defaultValue="columns">
@@ -518,34 +527,32 @@ export default function TablesPage() {
                           <a href={`/crud?db=${dbName}&table=${table.name}`}>Manage Data</a>
                         </Button>
 
-                        {nodeRole !== "slave" && (
-                          <AlertDialog>
-                            <AlertDialogTrigger asChild>
-                              <Button variant="destructive">
-                                <Trash2 className="mr-2 h-4 w-4" />
-                                Delete Table
-                              </Button>
-                            </AlertDialogTrigger>
-                            <AlertDialogContent>
-                              <AlertDialogHeader>
-                                <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-                                <AlertDialogDescription>
-                                  This will permanently delete the table "{table.name}" and all its data. This action
-                                  cannot be undone.
-                                </AlertDialogDescription>
-                              </AlertDialogHeader>
-                              <AlertDialogFooter>
-                                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                <AlertDialogAction
-                                  onClick={() => handleDeleteTable(table.name)}
-                                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                                >
-                                  Delete
-                                </AlertDialogAction>
-                              </AlertDialogFooter>
-                            </AlertDialogContent>
-                          </AlertDialog>
-                        )}
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button variant="destructive" disabled={nodeRole === "slave"}>
+                              <Trash2 className="mr-2 h-4 w-4" />
+                              Delete Table
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will permanently delete the table "{table.name}" and all its data. This action
+                                cannot be undone.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={() => handleDeleteTable(table.name)}
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                              >
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
                       </div>
                     </TabsContent>
                   </Tabs>

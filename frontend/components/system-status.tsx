@@ -12,6 +12,7 @@ export function SystemStatus() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date())
+  const [shardCount, setShardCount] = useState<number>(3) // Default to 3 shards
 
   const fetchNodes = async () => {
     setLoading(true)
@@ -19,6 +20,13 @@ export function SystemStatus() {
       const response = await apiService.getNodes()
       if (response.success && response.result) {
         setNodes(response.result)
+
+        // Determine the shard count from the nodes
+        if (response.result.length > 0) {
+          const maxShardId = Math.max(...response.result.map((node) => node.shardId))
+          setShardCount(maxShardId + 1) // Assuming shardIds are 0-based
+        }
+
         setError(null)
       } else {
         setError(response.message || "Failed to fetch nodes")
@@ -63,7 +71,7 @@ export function SystemStatus() {
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-4 gap-2">
                 <div className="flex flex-col items-center justify-center rounded-md bg-muted p-3">
                   <span className="text-2xl font-bold">{nodes.length}</span>
                   <span className="text-xs text-muted-foreground">Total Nodes</span>
@@ -75,6 +83,10 @@ export function SystemStatus() {
                 <div className="flex flex-col items-center justify-center rounded-md bg-muted p-3">
                   <span className="text-2xl font-bold">{healthySlaves}</span>
                   <span className="text-xs text-muted-foreground">Healthy Slaves</span>
+                </div>
+                <div className="flex flex-col items-center justify-center rounded-md bg-muted p-3">
+                  <span className="text-2xl font-bold">{shardCount}</span>
+                  <span className="text-xs text-muted-foreground">Shards</span>
                 </div>
               </div>
 
@@ -109,6 +121,7 @@ export function SystemStatus() {
                           </div>
                           <div className="flex items-center gap-2">
                             <Badge variant={node.role === "master" ? "default" : "secondary"}>{node.role}</Badge>
+                            <Badge variant="outline">Shard {node.shardId}</Badge>
                             {node.isHealthy ? (
                               <CheckCircle2 className="h-4 w-4 text-green-500" />
                             ) : (

@@ -148,7 +148,7 @@ export default function DatabasesPage() {
             {nodeRole === "slave" ? (
               <div className="flex items-center gap-2">
                 <span className="text-sm text-muted-foreground">
-                  This is a slave node. Write operations must be performed on the master.
+                  This is a slave node. Database management operations must be performed on the master.
                 </span>
                 {masterUrl && (
                   <Button variant="outline" size="sm" asChild>
@@ -159,38 +159,40 @@ export default function DatabasesPage() {
                 )}
               </div>
             ) : (
-              <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-                <DialogTrigger asChild>
-                  <Button>
-                    <Plus className="mr-2 h-4 w-4" />
-                    Create Database
-                  </Button>
-                </DialogTrigger>
-                <DialogContent>
-                  <DialogHeader>
-                    <DialogTitle>Create New Database</DialogTitle>
-                    <DialogDescription>Enter a name for your new database.</DialogDescription>
-                  </DialogHeader>
-                  <div className="grid gap-4 py-4">
-                    <div className="grid gap-2">
-                      <Label htmlFor="name">Database Name</Label>
-                      <Input
-                        id="name"
-                        value={newDbName}
-                        onChange={(e) => setNewDbName(e.target.value)}
-                        placeholder="Enter database name"
-                      />
-                    </div>
-                  </div>
-                  <DialogFooter>
-                    <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
-                      Cancel
-                    </Button>
-                    <Button onClick={handleCreateDatabase}>Create Database</Button>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              <></>
             )}
+
+            <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+              <DialogTrigger asChild>
+                <Button disabled={nodeRole === "slave"}>
+                  <Plus className="mr-2 h-4 w-4" />
+                  Create Database
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Create New Database</DialogTitle>
+                  <DialogDescription>Enter a name for your new database.</DialogDescription>
+                </DialogHeader>
+                <div className="grid gap-4 py-4">
+                  <div className="grid gap-2">
+                    <Label htmlFor="name">Database Name</Label>
+                    <Input
+                      id="name"
+                      value={newDbName}
+                      onChange={(e) => setNewDbName(e.target.value)}
+                      placeholder="Enter database name"
+                    />
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button onClick={handleCreateDatabase}>Create Database</Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
 
           {loading ? (
@@ -224,33 +226,31 @@ export default function DatabasesPage() {
                         <a href={`/tables?db=${dbName}`}>View Tables</a>
                       </Button>
 
-                      {nodeRole !== "slave" && (
-                        <AlertDialog>
-                          <AlertDialogTrigger asChild>
-                            <Button variant="destructive" size="icon">
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </AlertDialogTrigger>
-                          <AlertDialogContent>
-                            <AlertDialogHeader>
-                              <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-                              <AlertDialogDescription>
-                                This will permanently delete the database "{dbName}" and all its tables. This action
-                                cannot be undone.
-                              </AlertDialogDescription>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                              <AlertDialogCancel>Cancel</AlertDialogCancel>
-                              <AlertDialogAction
-                                onClick={() => handleDeleteDatabase(dbName)}
-                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                              >
-                                Delete
-                              </AlertDialogAction>
-                            </AlertDialogFooter>
-                          </AlertDialogContent>
-                        </AlertDialog>
-                      )}
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
+                          <Button variant="destructive" size="icon" disabled={nodeRole === "slave"}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+                            <AlertDialogDescription>
+                              This will permanently delete the database "{dbName}" and all its tables. This action
+                              cannot be undone.
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>Cancel</AlertDialogCancel>
+                            <AlertDialogAction
+                              onClick={() => handleDeleteDatabase(dbName)}
+                              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                            >
+                              Delete
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
                     </div>
                   </CardContent>
                 </Card>

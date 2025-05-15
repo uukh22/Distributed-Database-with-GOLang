@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,12 +22,14 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// Constants for node roles and election timeout
 const (
 	RoleMaster      = "master"
 	RoleSlave       = "slave"
 	ElectionTimeout = 5 * time.Second
 )
 
+// Config holds the configuration loaded from config.json
 type Config struct {
 	SelfURL     string            `json:"self_url"`
 	MasterURL   string            `json:"master_url"`
@@ -32,6 +38,7 @@ type Config struct {
 	ShardCount  int               `json:"shard_count"`
 }
 
+// MySQLConfig holds MySQL connection details
 type MySQLConfig struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
@@ -39,11 +46,13 @@ type MySQLConfig struct {
 	Port     string `json:"port"`
 }
 
+// ReplicationConfig holds replication user credentials
 type ReplicationConfig struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 }
 
+// Node represents a node in the cluster
 type Node struct {
 	ID        string    `json:"id"`
 	Role      string    `json:"role"`
@@ -54,17 +63,20 @@ type Node struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// SystemState tracks the current master and node list
 type SystemState struct {
 	CurrentMaster string
 	Nodes         []*Node
 }
 
+// Response is the standard API response format
 type Response struct {
 	Success bool        `json:"success"`
 	Message string      `json:"message"`
 	Result  interface{} `json:"result,omitempty"`
 }
 
+// Global variables
 var (
 	config      Config
 	db          *sql.DB
@@ -73,6 +85,7 @@ var (
 	currentRole string
 )
 
+// loadConfig loads and validates the configuration from config.json
 func loadConfig() error {
 	file, err := os.Open("config.json")
 	if err != nil {
@@ -85,7 +98,7 @@ func loadConfig() error {
 		return fmt.Errorf("failed to decode config file: %w", err)
 	}
 
-	// Normalize URLs to remove trailing slashes
+	// Normalize URLs
 	config.SelfURL = strings.TrimSuffix(config.SelfURL, "/")
 	config.MasterURL = strings.TrimSuffix(config.MasterURL, "/")
 
@@ -111,7 +124,6 @@ func loadConfig() error {
 	if config.Replication.User == "" {
 		config.Replication.User = "replica"
 	}
-
 	// Validate URLs
 	if !strings.HasPrefix(config.SelfURL, "http://") || !strings.HasPrefix(config.MasterURL, "http://") {
 		return fmt.Errorf("self_url and master_url must start with http://")
@@ -120,6 +132,7 @@ func loadConfig() error {
 	return nil
 }
 
+// main is the entry point of the application
 func main() {
 	if err := loadConfig(); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -143,6 +156,7 @@ func main() {
 	select {}
 }
 
+// initializeNode sets up the database and node role
 func initializeNode() {
 	var err error
 	connStr := fmt.Sprintf("%s:%s@tcp(%s:%s)/?parseTime=true",
@@ -153,9 +167,9 @@ func initializeNode() {
 	if err != nil {
 		log.Printf("Database connection failed: %v", err)
 	} else {
-		db.SetMaxOpenConns(25)
-		db.SetMaxIdleConns(5)
-		db.SetConnMaxLifetime(5 * time.Minute)
+		db.SetMaxOpenConns(50)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxLifetime(3 * time.Minute)
 
 		err = db.Ping()
 		if err != nil {
@@ -187,20 +201,32 @@ func initializeNode() {
 		return
 	}
 
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS cluster.table_shards (
+			db_name VARCHAR(255) NOT NULL,
+			table_name VARCHAR(255) NOT NULL,
+			shard_id INT NOT NULL,
+			shard_key VARCHAR(255),
+			PRIMARY KEY (db_name, table_name)
+		)
+	`)
+	if err != nil {
+		log.Printf("Failed to create table_shards table: %v", err)
+		return
+	}
+
 	log.Printf("Checking role: selfURL=%s, masterURL=%s", config.SelfURL, config.MasterURL)
 	if config.SelfURL == config.MasterURL {
 		currentRole = RoleMaster
 		state.CurrentMaster = config.SelfURL
 		log.Println("Registering as MASTER node")
 		registerNode(config.SelfURL, RoleMaster, calculateShardID(config.SelfURL))
-		// Verify role in database
 		var role string
 		err = db.QueryRow("SELECT role FROM cluster.nodes WHERE url = ?", config.SelfURL).Scan(&role)
 		if err != nil {
 			log.Printf("Error verifying master role in database: %v", err)
 		} else if role != RoleMaster {
 			log.Printf("Master role mismatch in database: expected %s, got %s", RoleMaster, role)
-			// Force update
 			_, err = db.Exec("UPDATE cluster.nodes SET role = ? WHERE url = ?", RoleMaster, config.SelfURL)
 			if err != nil {
 				log.Printf("Error correcting master role: %v", err)
@@ -213,10 +239,10 @@ func initializeNode() {
 	} else {
 		currentRole = RoleSlave
 		state.CurrentMaster = config.MasterURL
-		shardID := calculateShardID(config.SelfURL)
+		//		shardID := calculateShardID(config.SelfURL)
 		log.Println("Registering as SLAVE node")
-		registerNode(config.SelfURL, RoleSlave, shardID)
-		registerNode(config.MasterURL, RoleMaster, calculateShardID(config.MasterURL))
+		//		registerNode(config.SelfURL, RoleSlave, shardID)
+		//		registerNode(config.MasterURL, RoleMaster, calculateShardID(config.MasterURL))
 		log.Println("Initialized as SLAVE node with master:", config.MasterURL)
 
 		parts := strings.Split(config.MasterURL, ":")
@@ -227,14 +253,20 @@ func initializeNode() {
 	}
 }
 
-func calculateShardID(url string) int {
-	hash := 0
-	for _, c := range url {
-		hash += int(c)
+// calculateShardID computes a shard ID based on a key
+func calculateShardID(key string) int {
+	if config.ShardCount <= 0 {
+		log.Printf("Warning: ShardCount in config is %d (not positive). Defaulting shardID to 0 for key '%s'.", config.ShardCount, key)
+		return 0 // Avoid division by zero or negative.
 	}
-	return hash % config.ShardCount
+	hash := 0
+	for _, char := range key {
+		hash = (hash*31 + int(char)) % config.ShardCount // A slightly better hash
+	}
+	return (hash & 0x7fffffff) % config.ShardCount // Ensure positive result
 }
 
+// registerWithMaster registers this node with the master
 func registerWithMaster() error {
 	client := http.Client{Timeout: 30 * time.Second}
 	payload := fmt.Sprintf(`{"url": "%s", "role": "%s", "shardId": %d}`, config.SelfURL, RoleSlave, calculateShardID(config.SelfURL))
@@ -263,6 +295,7 @@ func registerWithMaster() error {
 	return nil
 }
 
+// registerWithMasterRetry attempts to register with the master with retries
 func registerWithMasterRetry() {
 	maxRetries := 5
 	retryDelay := 3 * time.Second
@@ -284,6 +317,7 @@ func registerWithMasterRetry() {
 	}
 }
 
+// registerHandler handles node registration requests
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -311,7 +345,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Force master role for selfURL if it's the master
 	if newNode.URL == config.SelfURL && config.SelfURL == config.MasterURL {
 		newNode.Role = RoleMaster
 	}
@@ -325,6 +358,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// startHTTPServer sets up and starts the HTTP server
 func startHTTPServer() {
 	r := mux.NewRouter()
 	r.Use(corsMiddleware)
@@ -343,6 +377,7 @@ func startHTTPServer() {
 	r.HandleFunc("/api/list-databases", listDatabasesHandler).Methods("GET", "OPTIONS")
 	r.HandleFunc("/api/drop-db", dropDatabaseHandler).Methods("POST", "OPTIONS")
 	r.HandleFunc("/api/create-table", createTableHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/api/slave-create-table", slaveCreateTableHandler).Methods("POST", "OPTIONS")
 	r.HandleFunc("/api/list-tables", listTablesHandler).Methods("GET", "OPTIONS")
 	r.HandleFunc("/api/drop-table", dropTableHandler).Methods("POST", "OPTIONS")
 	r.HandleFunc("/api/link-tables", linkTablesHandler).Methods("POST", "OPTIONS")
@@ -362,6 +397,7 @@ func startHTTPServer() {
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
 
+// registerNode adds or updates a node in the database
 func registerNode(url, role string, shardID int) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -401,6 +437,7 @@ func registerNode(url, role string, shardID int) {
 	loadNodesFromDB()
 }
 
+// loadNodesFromDB refreshes the in-memory node list from the database
 func loadNodesFromDB() {
 	rows, err := db.Query(`
 		SELECT id, role, url, is_healthy, last_seen, shard_id, created_at 
@@ -430,6 +467,7 @@ func loadNodesFromDB() {
 	state.Nodes = nodes
 }
 
+// monitorMaster checks the master's health and triggers an election if necessary
 func monitorMaster() {
 	for {
 		time.Sleep(2 * time.Second)
@@ -440,6 +478,7 @@ func monitorMaster() {
 	}
 }
 
+// startElection initiates a leader election among healthy slaves
 func startElection() {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -477,6 +516,7 @@ func startElection() {
 	}
 }
 
+// promoteToMaster promotes this node to master
 func promoteToMaster() {
 	log.Println("Promoting self to master")
 	currentRole = RoleMaster
@@ -506,14 +546,14 @@ func configureMaster(db *sql.DB) error {
 	_, err := db.Exec(fmt.Sprintf(`CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'`,
 		config.Replication.User, config.Replication.Password))
 	if err != nil {
-		log.Printf("Error creating user: %v", err)
+		log.Printf("Error creating replication user: %v", err)
 		return err
 	}
 
 	_, err = db.Exec(fmt.Sprintf(`GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '%s'@'%%'`,
 		config.Replication.User))
 	if err != nil {
-		log.Printf("Error granting privileges: %v", err)
+		log.Printf("Error granting replication privileges: %v", err)
 		return err
 	}
 
@@ -523,17 +563,37 @@ func configureMaster(db *sql.DB) error {
 		return err
 	}
 
+	// Verify binary logging
+	rows, err := db.Query("SHOW MASTER STATUS")
+	if err != nil {
+		log.Printf("Error checking master status: %v", err)
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		log.Println("Binary logging is not enabled on master")
+		return fmt.Errorf("binary logging not enabled")
+	}
+
+	log.Println("Master configured for replication")
 	return nil
 }
 
 func configureSlave(db *sql.DB, masterHost string, masterPort int) error {
+	// Stop any existing replication first
 	_, err := db.Exec("STOP SLAVE;")
 	if err != nil {
 		log.Printf("Warning: Failed to stop slave - %v", err)
 	}
 
-	masterDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true",
-		config.Replication.User, config.Replication.Password, masterHost, masterPort))
+	// Connect to master using credentials from config
+	masterConnStr := fmt.Sprintf("%s:%s@tcp(%s:%d)/",
+		config.Replication.User,
+		config.Replication.Password,
+		masterHost,
+		masterPort,
+	)
+	masterDB, err := sql.Open("mysql", masterConnStr)
 	if err != nil {
 		log.Printf("Error connecting to master: %v", err)
 		return fmt.Errorf("failed to connect to master: %w", err)
@@ -551,23 +611,31 @@ func configureSlave(db *sql.DB, masterHost string, masterPort int) error {
 		logPos     int
 		binlogDoDB string
 		ignoredDB  string
+		// Add this variable to catch the extra column.
+		executedGtidSet string
 	)
 
-	err = masterDB.QueryRow("SHOW MASTER STATUS").Scan(&logFile, &logPos, &binlogDoDB, &ignoredDB)
+	// Use the correct number of variables to match the columns returned by SHOW MASTER STATUS
+	err = masterDB.QueryRow("SHOW MASTER STATUS").Scan(&logFile, &logPos, &binlogDoDB, &ignoredDB, &executedGtidSet)
 	if err != nil {
 		log.Printf("Error getting master status: %v", err)
 		return fmt.Errorf("failed to get master status: %w", err)
 	}
 
-	_, err = db.Exec(fmt.Sprintf(`
-		CHANGE MASTER TO
-		MASTER_HOST='%s',
-		MASTER_PORT=%d,
-		MASTER_USER='%s',
-		MASTER_PASSWORD='%s',
-		MASTER_LOG_FILE='%s',
-		MASTER_LOG_POS=%d;
-	`, masterHost, masterPort, config.Replication.User, config.Replication.Password, logFile, logPos))
+	changeMasterQuery := fmt.Sprintf(`
+        CHANGE MASTER TO
+        MASTER_HOST='%s',
+        MASTER_PORT=%d,
+        MASTER_USER='%s',
+        MASTER_PASSWORD='%s',
+        MASTER_LOG_FILE='%s',
+        MASTER_LOG_POS=%d;
+    `, masterHost, masterPort,
+		config.Replication.User,
+		config.Replication.Password,
+		logFile, logPos)
+
+	_, err = db.Exec(changeMasterQuery)
 	if err != nil {
 		log.Printf("Error configuring slave: %v", err)
 		return fmt.Errorf("failed to configure slave: %w", err)
@@ -583,35 +651,99 @@ func configureSlave(db *sql.DB, masterHost string, masterPort int) error {
 	return nil
 }
 
+// checkNodeHealth checks if a node is responsive
 func checkNodeHealth(url string) bool {
 	client := http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url + "/api/health")
 	return err == nil && resp.StatusCode == http.StatusOK
 }
 
-func replicateToNodes(operation map[string]interface{}) {
-	loadNodesFromDB()
+// replicateToNodes sends replication operations to relevant slave nodes
+func replicateToNodes(operationData map[string]interface{}) {
+	shardIDInterface, shardIdOk := operationData["shardId"]
+	if !shardIdOk {
+		log.Printf("CRITICAL: replicateToNodes called without shardId in operationData: %+v. Skipping replication signal.", operationData)
+		return // Or assign a default, but this indicates a programming error
+	}
+	// Ensure shardID is a number, as it's often float64 from JSON decoding
+	var shardID float64
+	switch v := shardIDInterface.(type) {
+	case float64:
+		shardID = v
+	case int:
+		shardID = float64(v)
+	default:
+		log.Printf("CRITICAL: replicateToNodes called with non-numeric shardId: %T, value: %v. Skipping.", shardIDInterface, shardIDInterface)
+		return
+	}
+
+	stateMutex.Lock()
+	nodesToReplicate := make([]*Node, 0, len(state.Nodes))
 	for _, node := range state.Nodes {
-		if node.Role == RoleSlave && node.URL != config.SelfURL && node.IsHealthy && node.ShardID == calculateShardID(node.URL) {
-			go func(url string) {
-				jsonData, _ := json.Marshal(operation)
-				client := http.Client{Timeout: 5 * time.Second}
-				_, err := client.Post(url+"/api/replicate", "application/json", strings.NewReader(string(jsonData)))
-				if err != nil {
-					log.Printf("Replication to %s failed: %v", url, err)
-					_, err = db.Exec(`
-						UPDATE cluster.nodes 
-						SET is_healthy = ?, last_seen = ? 
-						WHERE url = ?`, false, time.Now(), url)
-					if err != nil {
-						log.Printf("Error updating node health: %v", err)
-					}
-				}
-			}(node.URL)
+		if node.Role == RoleSlave && node.URL != config.SelfURL && node.IsHealthy {
+			nodesToReplicate = append(nodesToReplicate, node)
 		}
+	}
+	stateMutex.Unlock()
+
+	if len(nodesToReplicate) == 0 {
+		log.Println("No healthy slave nodes found to send HTTP replication signal to.")
+		return
+	}
+
+	jsonData, err := json.Marshal(operationData)
+	if err != nil {
+		log.Printf("Error marshaling replication data: %v. Data: %+v", err, operationData)
+		return
+	}
+
+	log.Printf("Master initiating HTTP replication signal to %d slaves for operation: %s, data_shardId: %.0f",
+		len(nodesToReplicate), operationData["operation"], shardID)
+
+	for _, node := range nodesToReplicate {
+		go func(slaveNode *Node, data []byte, opData map[string]interface{}) { // Pass opData for logging
+			targetURL := slaveNode.URL + "/api/replicate"
+			// Log the specific shardId being sent in this iteration
+			log.Printf("Sending HTTP replication signal to slave %s (%s) for operation %s, data_shardId: %.0f",
+				slaveNode.ID, slaveNode.URL, opData["operation"], opData["shardId"].(float64))
+
+			client := http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Post(targetURL, "application/json", bytes.NewBuffer(data))
+			if err != nil {
+				log.Printf("HTTP replication signal to %s FAILED: %v", slaveNode.URL, err)
+				setNodeHealthStatus(slaveNode.URL, false) // Mark slave as potentially unhealthy
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				log.Printf("HTTP replication signal to %s returned status %d. Response: %s", slaveNode.URL, resp.StatusCode, string(bodyBytes))
+			} else {
+				log.Printf("Successfully sent HTTP replication signal to %s (status %d)", slaveNode.URL, resp.StatusCode)
+			}
+		}(node, jsonData, operationData) // Pass operationData to goroutine
 	}
 }
 
+func setNodeHealthStatus(nodeURL string, isHealthy bool) {
+	if db == nil {
+		log.Printf("setNodeHealthStatus: DB not available to update health for %s", nodeURL)
+		return
+	}
+	// Ensure stateMutex is used if 'db' or 'state.Nodes' updates are concurrent elsewhere
+	// stateMutex.Lock()
+	// defer stateMutex.Unlock()
+	_, err := db.Exec(`UPDATE cluster.nodes SET is_healthy = ?, last_seen = ? WHERE url = ?`,
+		isHealthy, time.Now().UTC(), nodeURL) // Store time in UTC
+	if err != nil {
+		log.Printf("Error updating node health in DB for %s: %v", nodeURL, err)
+	} else {
+		log.Printf("Node health for %s set to %v in DB.", nodeURL, isHealthy)
+	}
+}
+
+// nodeRoleHandler returns the node's role and shard information
 func nodeRoleHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -630,6 +762,7 @@ func nodeRoleHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// listNodes returns the list of nodes in the cluster
 func listNodes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -645,6 +778,7 @@ func listNodes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createDatabaseHandler creates a new database with MySQL and HTTP replication
 func createDatabaseHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -656,21 +790,27 @@ func createDatabaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+	// If this node is a slave, forward the request to the master
+	if currentRole == RoleSlave {
+		log.Println("Slave node received createDatabase request, forwarding to master.")
+		forwardRequestToMaster(w, r)
 		return
 	}
 
+	// --- Master Logic ---
 	var req struct {
 		DBName string `json:"dbName"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Read body for master processing (forwardRequestToMaster has already read it for slaves)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request body: " + err.Error()})
+		return
+	}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		json.NewEncoder(w).Encode(Response{
 			Success: false,
-			Message: "Invalid request format",
+			Message: "Invalid request format: " + err.Error(),
 		})
 		return
 	}
@@ -683,8 +823,11 @@ func createDatabaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.Exec("CREATE DATABASE IF NOT EXISTS " + req.DBName)
+	// Execute on master
+	// MySQL will replicate this DDL statement to slaves.
+	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS " + SanitizeIdentifier(req.DBName)) // Ensure DBName is sanitized
 	if err != nil {
+		log.Printf("Error creating database '%s' on master: %v", req.DBName, err)
 		json.NewEncoder(w).Encode(Response{
 			Success: false,
 			Message: "Error creating database: " + err.Error(),
@@ -692,153 +835,148 @@ func createDatabaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	replicateToNodes(map[string]interface{}{
-		"operation": "create_db",
+	log.Printf("Database '%s' created successfully on master.", req.DBName)
+
+	// HTTP Replicate to slaves (as a notification/signal, MySQL handles data)
+	operation := map[string]interface{}{
+		"operation": "create_database",
 		"dbName":    req.DBName,
-	})
+		"shardId":   float64(calculateShardID(req.DBName)), // ShardID for a DB might be conceptual
+	}
+	replicateToNodes(operation)
 
 	json.NewEncoder(w).Encode(Response{
 		Success: true,
-		Message: fmt.Sprintf("Database '%s' created successfully", req.DBName),
+		Message: fmt.Sprintf("Database '%s' created successfully on master and replication initiated.", req.DBName),
 	})
 }
 
+// dropDatabaseHandler drops a database (replicated via MySQL)
 func dropDatabaseHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Database not connected"})
 		return
 	}
 
-	if currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+	if currentRole == RoleSlave {
+		log.Printf("Slave node received dropDatabase request. Operation not allowed.")
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Dropping databases is only allowed on the master node."})
 		return
 	}
 
+	// --- Master Logic ---
 	var req struct {
 		DBName string `json:"dbName"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid request format",
-		})
-		return
-	}
-
-	if req.DBName == "" {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database name is required",
-		})
-		return
-	}
-
-	if req.DBName == "information_schema" || req.DBName == "mysql" || req.DBName == "performance_schema" || req.DBName == "sys" {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Cannot drop system database",
-		})
-		return
-	}
-
-	_, err := db.Exec("DROP DATABASE IF EXISTS " + req.DBName)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error dropping database: " + err.Error(),
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request body: " + err.Error()})
+		return
+	}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request: " + err.Error()})
+		return
+	}
+	if req.DBName == "" {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Database name required"})
 		return
 	}
 
+	protectedDBs := map[string]bool{"information_schema": true, "mysql": true, "performance_schema": true, "sys": true, "cluster": true}
+	if protectedDBs[strings.ToLower(req.DBName)] {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Cannot drop system database: " + req.DBName})
+		return
+	}
+
+	_, err = db.Exec("DROP DATABASE IF EXISTS " + SanitizeIdentifier(req.DBName))
+	if err != nil {
+		log.Printf("Error dropping database '%s' on master: %v", req.DBName, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error dropping database: " + err.Error()})
+		return
+	}
+	log.Printf("Database '%s' dropped successfully on master.", req.DBName)
+
+	// Optional HTTP notification
 	replicateToNodes(map[string]interface{}{
-		"operation": "drop_db",
+		"operation": "drop_database",
 		"dbName":    req.DBName,
+		"shardId":   float64(calculateShardID(req.DBName)),
 	})
 
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
-		Message: fmt.Sprintf("Database '%s' dropped successfully", req.DBName),
-	})
+	json.NewEncoder(w).Encode(Response{Success: true, Message: fmt.Sprintf("Database '%s' dropped", req.DBName)})
 }
 
+// dropTableHandler drops a table (replicated via MySQL)
 func dropTableHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Database not connected"})
 		return
 	}
 
-	if currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+	if currentRole == RoleSlave {
+		log.Printf("Slave node received dropTable request. Operation not allowed.")
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Dropping tables is only allowed on the master node."})
 		return
 	}
 
+	// --- Master Logic ---
 	var req struct {
 		DBName    string `json:"dbName"`
 		TableName string `json:"tableName"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid request format",
-		})
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request body: " + err.Error()})
 		return
 	}
-
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request: " + err.Error()})
+		return
+	}
 	if req.DBName == "" || req.TableName == "" {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database name and table name are required",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "DB name and table name required"})
 		return
 	}
+
+	safeDBName := SanitizeIdentifier(req.DBName)
+	safeTableName := SanitizeIdentifier(req.TableName)
 
 	dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, req.DBName))
+		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, safeDBName))
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error connecting to database: " + err.Error(),
-		})
+		log.Printf("Error connecting to database '%s' on master: %v", safeDBName, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error connecting to DB: " + err.Error()})
 		return
 	}
 	defer dbConn.Close()
 
-	_, err = dbConn.Exec("DROP TABLE IF EXISTS " + req.TableName)
+	_, err = dbConn.Exec("DROP TABLE IF EXISTS " + safeTableName)
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error dropping table: " + err.Error(),
-		})
+		log.Printf("Error dropping table '%s.%s' on master: %v", safeDBName, safeTableName, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error dropping table: " + err.Error()})
 		return
 	}
+	log.Printf("Table '%s.%s' dropped successfully on master.", safeDBName, safeTableName)
 
+	_, err = db.Exec("DELETE FROM cluster.table_shards WHERE db_name = ? AND table_name = ?", safeDBName, safeTableName)
+	if err != nil {
+		log.Printf("Error removing table shard mapping for '%s.%s' on master: %v", safeDBName, safeTableName, err)
+	}
+
+	// Determine a representative shardId for the dropped table for notification purposes
+	shardID := calculateShardID(safeDBName + "." + safeTableName)
 	replicateToNodes(map[string]interface{}{
 		"operation": "drop_table",
-		"dbName":    req.DBName,
-		"tableName": req.TableName,
+		"dbName":    safeDBName,
+		"tableName": safeTableName,
+		"shardId":   float64(shardID),
 	})
 
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
-		Message: fmt.Sprintf("Table '%s' dropped successfully", req.TableName),
-	})
+	json.NewEncoder(w).Encode(Response{Success: true, Message: fmt.Sprintf("Table '%s' dropped", safeTableName)})
 }
 
 func listDatabasesHandler(w http.ResponseWriter, r *http.Request) {
@@ -850,6 +988,58 @@ func listDatabasesHandler(w http.ResponseWriter, r *http.Request) {
 			Message: "Database connection not established. Please check MySQL settings.",
 		})
 		return
+	}
+
+	// Check replication status on slave
+	if currentRole == RoleSlave {
+		rows, err := db.Query("SHOW SLAVE STATUS")
+		if err != nil {
+			log.Printf("Error checking slave status: %v", err)
+		} else {
+			defer rows.Close()
+			if rows.Next() {
+				columns, _ := rows.Columns()
+				values := make([]sql.RawBytes, len(columns))
+				scanArgs := make([]interface{}, len(values))
+				for i := range values {
+					scanArgs[i] = &values[i]
+				}
+				if err := rows.Scan(scanArgs...); err != nil {
+					log.Printf("Error scanning slave status: %v", err)
+				} else {
+					var slaveIORunning, slaveSQLRunning, lastError string
+					var secondsBehindMaster sql.NullInt64
+					for i, col := range columns {
+						switch col {
+						case "Slave_IO_Running":
+							slaveIORunning = string(values[i])
+						case "Slave_SQL_Running":
+							slaveSQLRunning = string(values[i])
+						case "Last_Error":
+							lastError = string(values[i])
+						case "Seconds_Behind_Master":
+							if values[i] != nil {
+								var val int64
+								fmt.Sscanf(string(values[i]), "%d", &val)
+								secondsBehindMaster = sql.NullInt64{Int64: val, Valid: true}
+							}
+						}
+					}
+					log.Printf("Replication Status: IO_Running=%s, SQL_Running=%s, Last_Error=%s, Seconds_Behind=%v",
+						slaveIORunning, slaveSQLRunning, lastError, secondsBehindMaster)
+					if slaveIORunning != "Yes" || slaveSQLRunning != "Yes" {
+						log.Printf("Replication issue detected, attempting to restart...")
+						parts := strings.Split(config.MasterURL, ":")
+						if len(parts) >= 3 {
+							host := strings.TrimPrefix(parts[1], "//")
+							if err := configureSlave(db, host, 3306); err != nil {
+								log.Printf("Failed to restart replication: %v", err)
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	rows, err := db.Query("SHOW DATABASES")
@@ -883,99 +1073,148 @@ func listDatabasesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createTableHandler creates a table with shard assignment (replicated via MySQL)
 func createTableHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
-		return
-	}
-
 	if currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+		http.Error(w, "Only master can create tables", http.StatusForbidden)
 		return
 	}
 
-	var req struct {
-		DBName    string            `json:"dbName"`
-		TableName string            `json:"tableName"`
-		Columns   map[string]string `json:"columns"`
-	}
+	dbName := r.FormValue("db")
+	tableName := r.FormValue("name")
+	shardID := r.FormValue("shard_id")
+	columns := r.FormValue("columns") // Added:  Comma-separated column definitions
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid request format",
-		})
+	if dbName == "" || tableName == "" || shardID == "" || columns == "" {
+		http.Error(w, "Database name, table name, shard ID, and columns are required", http.StatusBadRequest)
 		return
 	}
 
-	if req.DBName == "" || req.TableName == "" || len(req.Columns) == 0 {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database name, table name, and columns are required",
-		})
+	// Basic validation
+	if !isValidIdentifier(dbName) || !isValidIdentifier(tableName) {
+		http.Error(w, "Invalid database or table name", http.StatusBadRequest)
 		return
 	}
 
-	dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, req.DBName))
+	shardIDInt, err := strconv.Atoi(shardID)
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error connecting to database: " + err.Error(),
-		})
+		http.Error(w, "Invalid shard ID: must be an integer", http.StatusBadRequest)
 		return
 	}
-	defer dbConn.Close()
 
-	query := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (", req.TableName)
-	columnDefs := []string{}
-	primaryKeys := []string{}
-
-	for name, dataType := range req.Columns {
-		columnDefs = append(columnDefs, fmt.Sprintf("%s %s", name, dataType))
-		if strings.HasSuffix(name, "_id") || strings.ToLower(name) == "id" {
-			primaryKeys = append(primaryKeys, name)
-		}
+	// Check if the shard ID is within the valid range (optional)
+	if shardIDInt < 0 || shardIDInt >= config.ShardCount {
+		http.Error(w, fmt.Sprintf("Shard ID must be between 0 and %d", config.ShardCount-1), http.StatusBadRequest)
+		return
 	}
 
-	query += strings.Join(columnDefs, ", ")
-
-	if len(primaryKeys) > 0 {
-		query += ", PRIMARY KEY (" + strings.Join(primaryKeys, ", ") + ")"
+	// Construct the CREATE TABLE query.
+	query := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (%s)", dbName, tableName, columns)
+	if err := executeSQL(query); err != nil {
+		http.Error(w, fmt.Sprintf("Error creating table: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	query += ")"
-
-	_, err = dbConn.Exec(query)
+	// Store shard ID in cluster.table_shards
+	insertShardQuery := "INSERT INTO cluster.table_shards (db_name, table_name, shard_id) VALUES (?, ?, ?)"
+	_, err = db.Exec(insertShardQuery, dbName, tableName, shardIDInt)
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error creating table: " + err.Error(),
-		})
-		return
+		log.Printf("Error storing shard information: %v", err)
+		http.Error(w, "Failed to store shard information", http.StatusInternalServerError)
+		return // Consider if the table should be dropped on failure.
 	}
 
-	replicateToNodes(map[string]interface{}{
-		"operation": "create_table",
-		"dbName":    req.DBName,
-		"tableName": req.TableName,
-		"query":     query,
-	})
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Table '%s.%s' created in shard %d successfully\n", dbName, tableName, shardIDInt)
 
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
-		Message: fmt.Sprintf("Table '%s' created successfully", req.TableName),
-	})
+	// Notify slaves to create the table.  Include the shard ID.
+	go notifySlaves(fmt.Sprintf("/api/create-table?db=%s&name=%s&shard_id=%d&columns=%s",
+		url.QueryEscape(dbName), url.QueryEscape(tableName), shardIDInt, url.QueryEscape(columns)))
 }
 
+func notifySlaves(endpoint string) {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+
+	for _, node := range state.Nodes {
+		if node.Role == RoleSlave {
+			targetURL := node.URL + endpoint // Use the provided endpoint
+			log.Printf("Notifying slave %s: %s", node.URL, targetURL)
+			resp, err := http.Post(targetURL, "application/json", nil) //  No body is needed for create table
+			if err != nil {
+				log.Printf("Error notifying slave %s: %v", node.URL, err)
+				continue // Continue to the next slave
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				log.Printf("Slave %s returned error: %s", node.URL, string(body))
+			}
+		}
+	}
+}
+
+func slaveCreateTableHandler(w http.ResponseWriter, r *http.Request) {
+	if currentRole != RoleSlave {
+		http.Error(w, "Only slaves should handle table creation requests from master", http.StatusForbidden)
+		return
+	}
+
+	dbName := r.FormValue("db")
+	tableName := r.FormValue("name")
+	shardID := r.FormValue("shard_id")
+
+	if dbName == "" || tableName == "" || shardID == "" {
+		http.Error(w, "Database name, table name, and shard ID are required", http.StatusBadRequest)
+		return
+	}
+	//basic validation
+	if !isValidIdentifier(dbName) || !isValidIdentifier(tableName) {
+		http.Error(w, "Invalid database or table name", http.StatusBadRequest)
+		return
+	}
+
+	shardIDInt, err := strconv.Atoi(shardID)
+	if err != nil {
+		http.Error(w, "Shard ID must be an integer", http.StatusBadRequest)
+		return
+	}
+
+	query := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (id INT AUTO_INCREMENT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)", dbName, tableName)
+	if err := executeSQL(query); err != nil {
+		http.Error(w, fmt.Sprintf("Error creating table on slave: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Store shard ID in cluster.table_shards on the slave
+	insertShardQuery := "INSERT INTO cluster.table_shards (db_name, table_name, shard_id) VALUES (?, ?, ?)"
+	_, err = db.Exec(insertShardQuery, dbName, tableName, shardIDInt)
+	if err != nil {
+		log.Printf("Error storing shard information on slave: %v", err)
+		http.Error(w, "Failed to store shard information on slave", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Table '%s.%s' created on slave in shard %d successfully\n", dbName, tableName, shardIDInt)
+}
+func isValidIdentifier(identifier string) bool {
+	// MySQL identifiers can contain letters, numbers, and underscores.
+	// They cannot start with a number.
+	reg := regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
+	return reg.MatchString(identifier)
+}
+
+// executeSQL executes a SQL query and logs any errors.
+func executeSQL(query string) error {
+	_, err := db.Exec(query)
+	if err != nil {
+		log.Printf("Error executing SQL: %s - %v", query, err)
+	}
+	return err
+}
+
+// listTablesHandler lists tables and their columns in a database
 func listTablesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1056,10 +1295,25 @@ func listTablesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		columnsRows.Close()
 
-		tables = append(tables, map[string]interface{}{
-			"name":    tableName,
-			"columns": columns,
-		})
+		var shardID int
+		var shardKey sql.NullString
+		err = db.QueryRow("SELECT shard_id, shard_key FROM cluster.table_shards WHERE db_name = ? AND table_name = ?",
+			dbName, tableName).Scan(&shardID, &shardKey)
+		if err != nil && err != sql.ErrNoRows {
+			log.Printf("Error retrieving shard info: %v", err)
+		}
+
+		tableInfo := map[string]interface{}{
+			"name":     tableName,
+			"columns":  columns,
+			"shardId":  shardID,
+			"shardKey": "",
+		}
+		if shardKey.Valid {
+			tableInfo["shardKey"] = shardKey.String
+		}
+
+		tables = append(tables, tableInfo)
 	}
 
 	json.NewEncoder(w).Encode(Response{
@@ -1068,349 +1322,341 @@ func listTablesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// linkTablesHandler creates a foreign key relationship between tables
 func linkTablesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
 	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Database not connected"})
 		return
 	}
 
-	if currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+	if currentRole == RoleSlave {
+		log.Println("Slave node received linkTables request, forwarding to master.")
+		forwardRequestToMaster(w, r)
 		return
 	}
 
+	// --- Master Logic ---
 	var req struct {
 		DBName         string `json:"dbName"`
-		Table1         string `json:"table1"`
-		Table2         string `json:"table2"`
-		Column1        string `json:"column1"`
-		Column2        string `json:"column2"`
-		ConstraintType string `json:"constraintType"`
+		Table1         string `json:"table1"`  // Parent table
+		Table2         string `json:"table2"`  // Child table (table to add FK to)
+		Column1        string `json:"column1"` // Column in parent table
+		Column2        string `json:"column2"` // Column in child table
+		ConstraintName string `json:"constraintName,omitempty"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid request format",
-		})
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request body: " + err.Error()})
 		return
 	}
-
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request: " + err.Error()})
+		return
+	}
 	if req.DBName == "" || req.Table1 == "" || req.Table2 == "" || req.Column1 == "" || req.Column2 == "" {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "All fields are required",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "All fields required for linking tables"})
 		return
+	}
+
+	safeDBName := SanitizeIdentifier(req.DBName)
+	safeTable1 := SanitizeIdentifier(req.Table1)
+	safeTable2 := SanitizeIdentifier(req.Table2)
+	safeCol1 := SanitizeIdentifier(req.Column1)
+	safeCol2 := SanitizeIdentifier(req.Column2)
+	constraintName := SanitizeIdentifier(req.ConstraintName)
+	if constraintName == "" {
+		constraintName = SanitizeIdentifier(fmt.Sprintf("fk_%s_%s_%s_%s", safeTable2, safeCol2, safeTable1, safeCol1))
 	}
 
 	dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, req.DBName))
+		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, safeDBName))
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error connecting to database: " + err.Error(),
-		})
+		log.Printf("Error connecting to database '%s' on master for linkTables: %v", safeDBName, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error connecting to DB: " + err.Error()})
 		return
 	}
 	defer dbConn.Close()
 
-	constraintName := fmt.Sprintf("fk_%s_%s", req.Table1, req.Table2)
-	query := fmt.Sprintf(`
-		ALTER TABLE %s
-		ADD CONSTRAINT %s
-		FOREIGN KEY (%s) REFERENCES %s(%s);
-	`, req.Table2, constraintName, req.Column2, req.Table1, req.Column1)
+	query := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(%s)",
+		safeTable2, constraintName, safeCol2, safeTable1, safeCol1)
 
 	_, err = dbConn.Exec(query)
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error linking tables: " + err.Error(),
-		})
+		log.Printf("Error linking tables ('%s' to '%s') on master: %v", safeTable2, safeTable1, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error linking tables: " + err.Error()})
 		return
 	}
+	log.Printf("Tables '%s' and '%s' linked successfully on master.", safeTable2, safeTable1)
 
+	// HTTP Replication for linking tables is generally not needed if DDL is replicated by MySQL.
+	// ShardID for notification could be related to the child table.
+	shardID := calculateShardID(safeDBName + "." + safeTable2)
 	replicateToNodes(map[string]interface{}{
 		"operation": "link_tables",
-		"dbName":    req.DBName,
-		"query":     query,
+		"dbName":    safeDBName,
+		"table1":    safeTable1,
+		"table2":    safeTable2,
+		"shardId":   float64(shardID),
 	})
 
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
-		Message: "Tables linked successfully!",
-	})
+	json.NewEncoder(w).Encode(Response{Success: true, Message: "Tables linked successfully"})
 }
 
+// crudHandler handles CRUD operations
 func crudHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Database not connected"})
 		return
 	}
 
 	var req struct {
-		DBName    string                 `json:"dbName"`
-		Operation string                 `json:"operation"`
-		Table     string                 `json:"table"`
-		Data      map[string]interface{} `json:"data"`
-		Where     map[string]interface{} `json:"where"`
+		DBName        string                 `json:"dbName"`
+		Operation     string                 `json:"operation"`
+		Table         string                 `json:"table"`
+		Data          map[string]interface{} `json:"data,omitempty"`
+		Where         map[string]interface{} `json:"where,omitempty"`
+		ShardKeyValue interface{}            `json:"shardKeyValue,omitempty"` // Value of the shard_key column for routing
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid request format",
-		})
+	// Read body once. If forwarding, forwardRequestToMaster will re-use these bytes.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request body: " + err.Error()})
 		return
 	}
+	// Restore body for current handler if not forwarding, or for forwardToMaster if it is.
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	if req.Operation != "read" && currentRole != RoleMaster {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: fmt.Sprintf("This is a slave node. Please send write operations to the master: %s", state.CurrentMaster),
-		})
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request format: " + err.Error()})
 		return
 	}
 
 	if req.DBName == "" || req.Table == "" || req.Operation == "" {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database name, table name, and operation are required",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "DB name, table, and operation required"})
 		return
 	}
 
-	shardID := calculateShardID(req.Table)
+	req.DBName = SanitizeIdentifier(req.DBName)
+	req.Table = SanitizeIdentifier(req.Table)
 
+	isWriteOperation := (req.Operation == "create" || req.Operation == "update" || req.Operation == "delete")
+
+	// Determine the shardID for the request based on ShardKeyValue if provided and table is sharded.
+	var shardIDForRequest int
+	var tableShardKeyCol sql.NullString // To store the name of the shard_key column for the table
+	var registeredTableShardID int      // The shard_id registered for the table itself in cluster.table_shards
+
+	// Query cluster.table_shards for the table's shard_key column and its registered shard_id
+	err = db.QueryRow("SELECT shard_id, shard_key FROM cluster.table_shards WHERE db_name = ? AND table_name = ?",
+		req.DBName, req.Table).Scan(&registeredTableShardID, &tableShardKeyCol)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("Warning: Table '%s.%s' not found in cluster.table_shards. Calculating shardID based on table name for routing.", req.DBName, req.Table)
+			shardIDForRequest = calculateShardID(req.DBName + "." + req.Table) // Fallback
+		} else {
+			log.Printf("Error retrieving shard info for '%s.%s': %v", req.DBName, req.Table, err)
+			json.NewEncoder(w).Encode(Response{Success: false, Message: "Error retrieving shard info: " + err.Error()})
+			return
+		}
+	} else {
+		// Table is registered in cluster.table_shards
+		if tableShardKeyCol.Valid && tableShardKeyCol.String != "" {
+			// Table is sharded by a specific column key. Use req.ShardKeyValue if provided.
+			if req.ShardKeyValue != nil {
+				shardIDForRequest = calculateShardID(fmt.Sprintf("%v", req.ShardKeyValue))
+				log.Printf("Calculated shardID %d for table '%s.%s' based on provided ShardKeyValue '%v' (shard_key column: '%s')",
+					shardIDForRequest, req.DBName, req.Table, req.ShardKeyValue, tableShardKeyCol.String)
+			} else if isWriteOperation {
+				// For writes, if ShardKeyValue is not provided for a table sharded by a key, it's problematic.
+				// Try to infer from Data if possible (e.g., on create)
+				var inferredShardValue interface{}
+				if req.Operation == "create" || req.Operation == "update" {
+					if val, ok := req.Data[tableShardKeyCol.String]; ok {
+						inferredShardValue = val
+					}
+				}
+				if inferredShardValue != nil {
+					shardIDForRequest = calculateShardID(fmt.Sprintf("%v", inferredShardValue))
+					log.Printf("Calculated shardID %d for table '%s.%s' based on inferred ShardKeyValue '%v' from Data (shard_key column: '%s')",
+						shardIDForRequest, req.DBName, req.Table, inferredShardValue, tableShardKeyCol.String)
+				} else {
+					log.Printf("Error: Write operation on sharded table '%s.%s' (key: '%s') but ShardKeyValue not provided and not inferable from Data.",
+						req.DBName, req.Table, tableShardKeyCol.String)
+					json.NewEncoder(w).Encode(Response{Success: false, Message: fmt.Sprintf("ShardKeyValue for column '%s' is required for this operation on table '%s.%s'", tableShardKeyCol.String, req.DBName, req.Table)})
+					return
+				}
+			} else {
+				// For reads on a table sharded by key, if ShardKeyValue is not provided,
+				// it might mean a scatter-gather query (not supported here) or query by non-shard key.
+				// In such cases, the read might be directed to the table's "home" shard or all shards.
+				// For simplicity here, we'll use the table's registered shardID.
+				shardIDForRequest = registeredTableShardID
+				log.Printf("Read operation on sharded table '%s.%s' (key: '%s') without ShardKeyValue. Using table's registered shardID: %d.",
+					req.DBName, req.Table, tableShardKeyCol.String, shardIDForRequest)
+			}
+		} else {
+			// Table is registered but has no specific shard_key column (e.g., sharded by table name or not sharded at data level)
+			shardIDForRequest = registeredTableShardID
+			log.Printf("Table '%s.%s' has no specific shard_key column in cluster.table_shards. Using its registered shardID: %d.",
+				req.DBName, req.Table, shardIDForRequest)
+		}
+	}
+
+	if currentRole == RoleSlave {
+		if isWriteOperation {
+			log.Printf("Slave node received WRITE op (%s) for '%s.%s' (data shard %d), forwarding to master.", req.Operation, req.DBName, req.Table, shardIDForRequest)
+			forwardRequestToMaster(w, r) // r.Body was restored earlier
+			return
+		}
+		// For READ operations on a slave:
+		// "access the tables with it's shard id" - This means a slave serves reads for its *own assigned shard*.
+		// We need to know which shard this slave node is responsible for.
+		// This is typically determined when the slave starts or by its configuration.
+		// Let's assume calculateShardID(config.SelfURL) gives the slave's *own* shard responsibility.
+		slaveOwnsShardID := calculateShardID(config.SelfURL) // Example: slave's identity determines its shard
+		if shardIDForRequest != slaveOwnsShardID {
+			log.Printf("Slave (serves shard %d) received READ request for data in shard %d of '%s.%s'. Denying access.",
+				slaveOwnsShardID, shardIDForRequest, req.DBName, req.Table)
+			json.NewEncoder(w).Encode(Response{
+				Success: false,
+				Message: fmt.Sprintf("This slave node (serves shard %d) does not handle requests for data in shard %d.", slaveOwnsShardID, shardIDForRequest),
+			})
+			return
+		}
+		log.Printf("Slave (serves shard %d) handling READ request for its shard for '%s.%s'.", slaveOwnsShardID, req.DBName, req.Table)
+	}
+
+	// --- Master Logic (for writes) or Slave Logic (for allowed reads on its own shard) ---
 	dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
 		config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, req.DBName))
 	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error connecting to database: " + err.Error(),
-		})
+		log.Printf("Error connecting to database '%s': %v", req.DBName, err)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error connecting to DB: " + err.Error()})
 		return
 	}
 	defer dbConn.Close()
 
 	var result interface{}
+	var execErr error
 
 	switch req.Operation {
 	case "create":
-		if req.Data == nil || len(req.Data) == 0 {
-			json.NewEncoder(w).Encode(Response{
-				Success: false,
-				Message: "Data is required for create operation",
-			})
+		if req.Data == nil {
+			json.NewEncoder(w).Encode(Response{Success: false, Message: "Data required for create"})
 			return
 		}
-		result, err = executeCreate(dbConn, req.Table, req.Data)
-
+		result, execErr = executeCreate(dbConn, req.Table, req.Data)
 	case "read":
-		result, err = executeRead(dbConn, req.Table, req.Where)
-
+		result, execErr = executeRead(dbConn, req.Table, req.Where)
 	case "update":
-		if req.Data == nil || len(req.Data) == 0 || req.Where == nil || len(req.Where) == 0 {
-			json.NewEncoder(w).Encode(Response{
-				Success: false,
-				Message: "Data and where conditions are required for update operation",
-			})
+		if req.Data == nil || req.Where == nil {
+			json.NewEncoder(w).Encode(Response{Success: false, Message: "Data and where required for update"})
 			return
 		}
-		result, err = executeUpdate(dbConn, req.Table, req.Data, req.Where)
-
+		result, execErr = executeUpdate(dbConn, req.Table, req.Data, req.Where)
 	case "delete":
-		if req.Where == nil || len(req.Where) == 0 {
-			json.NewEncoder(w).Encode(Response{
-				Success: false,
-				Message: "Where conditions are required for delete operation",
-			})
+		if req.Where == nil {
+			json.NewEncoder(w).Encode(Response{Success: false, Message: "Where required for delete"})
 			return
 		}
-		result, err = executeDelete(dbConn, req.Table, req.Where)
-
+		result, execErr = executeDelete(dbConn, req.Table, req.Where)
 	default:
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Invalid operation",
-		})
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid operation"})
 		return
 	}
 
-	if err != nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Error executing operation: " + err.Error(),
-		})
+	if execErr != nil {
+		log.Printf("Error executing %s on '%s.%s': %v", req.Operation, req.DBName, req.Table, execErr)
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "Error executing operation: " + execErr.Error()})
 		return
 	}
 
-	if req.Operation != "read" {
+	if isWriteOperation && currentRole == RoleMaster {
+		log.Printf("Master executed %s on '%s.%s' for data shard %d. Initiating HTTP replication signal.", req.Operation, req.DBName, req.Table, shardIDForRequest)
 		replicateToNodes(map[string]interface{}{
-			"operation": req.Operation,
-			"dbName":    req.DBName,
-			"table":     req.Table,
-			"data":      req.Data,
-			"where":     req.Where,
-			"shardId":   shardID,
+			"operation":     req.Operation,
+			"dbName":        req.DBName,
+			"table":         req.Table,
+			"data":          req.Data,
+			"where":         req.Where,
+			"shardId":       float64(shardIDForRequest), // This is the shardId of the *data* affected
+			"shardKeyValue": req.ShardKeyValue,          // Pass along the original shard key value for context
 		})
 	}
 
-	json.NewEncoder(w).Encode(Response{
-		Success: true,
-		Result:  result,
-	})
+	json.NewEncoder(w).Encode(Response{Success: true, Result: result})
 }
 
+// replicationHandler handles replication requests from the master
 func replicationHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if db == nil {
-		json.NewEncoder(w).Encode(Response{
-			Success: false,
-			Message: "Database connection not established. Please check MySQL settings.",
-		})
+	if currentRole == RoleMaster {
+		log.Printf("Master node received a /api/replicate call. This should only be called on slaves. Ignoring.")
+		http.Error(w, "This is a master node. Replication endpoint is for slaves.", http.StatusBadRequest)
+		return
+	}
+
+	if db == nil { // Should not happen if slave is operational
+		log.Printf("Slave received replication signal, but DB not connected.")
+		json.NewEncoder(w).Encode(Response{Success: false, Message: "DB not connected on slave"})
 		return
 	}
 
 	var req map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid replication request", http.StatusBadRequest)
+		log.Printf("Slave: Error decoding replication request: %v", err)
+		http.Error(w, "Invalid replication request format", http.StatusBadRequest)
 		return
 	}
 
-	operation, ok := req["operation"].(string)
-	if !ok {
-		http.Error(w, "Invalid operation in replication request", http.StatusBadRequest)
+	operation, _ := req["operation"].(string)
+	dbName, _ := req["dbName"].(string)
+	shardIDFloat, shardIdOk := req["shardId"].(float64) // This is the shardId of the *data* affected
+
+	log.Printf("Slave (%s) received HTTP replication signal: Op=%s, DBName=%s, data_shardId=%v, FullReq: %+v",
+		config.SelfURL, operation, dbName, req["shardId"], req)
+
+	if !shardIdOk {
+		log.Printf("Slave: Received replication signal without a valid data_shardId. Req: %+v", req)
+		// Respond with success as it's just a signal, but log the issue.
+		json.NewEncoder(w).Encode(Response{
+			Success: true, // Or false if shardId is critical for any app logic
+			Message: "Slave acknowledged replication signal, but data_shardId was missing or invalid.",
+		})
 		return
 	}
 
-	dbName, ok := req["dbName"].(string)
-	if !ok {
-		http.Error(w, "Missing database name in replication request", http.StatusBadRequest)
-		return
-	}
+	// Application-level logic for the slave based on the signal.
+	// Example: If this slave is responsible for the data_shardId mentioned, or for all shards,
+	// it might invalidate a cache or perform other shard-specific tasks.
+	slaveOwnsShardID := calculateShardID(config.SelfURL) // Example: Slave's identity determines its shard responsibility
 
-	shardID, ok := req["shardId"].(float64)
-	if !ok || int(shardID) != calculateShardID(config.SelfURL) {
-		http.Error(w, "Invalid shard ID for this node", http.StatusBadRequest)
-		return
-	}
+	log.Printf("Slave (serves shard %d) acknowledged replication signal for operation '%s' concerning data_shardId '%.0f'. MySQL replication is primary for data consistency.",
+		slaveOwnsShardID, operation, shardIDFloat)
 
-	var err error
+	// Example application-level task:
+	// if int(shardIDFloat) == slaveOwnsShardID {
+	//    log.Printf("Slave (shard %d) is responsible for this data_shardId. Performing app-level tasks (e.g., cache invalidation)...", slaveOwnsShardID)
+	//    // invalidateCacheForShard(int(shardIDFloat), dbName, req["table"])
+	// } else {
+	//    log.Printf("Slave (shard %d) is NOT directly responsible for data_shardId %.0f. No specific app-level tasks for this shard.", slaveOwnsShardID, shardIDFloat)
+	// }
+	// If slaves are generic read replicas, they might always perform some action regardless of shardId,
+	// or if the action is global (e.g. updating some shared metadata if not sharded).
 
-	switch operation {
-	case "create_db":
-		_, err = db.Exec("CREATE DATABASE IF NOT EXISTS " + dbName)
-
-	case "drop_db":
-		_, err = db.Exec("DROP DATABASE IF EXISTS " + dbName)
-
-	case "create_table":
-		query, ok := req["query"].(string)
-		if !ok {
-			http.Error(w, "Missing query in replication request", http.StatusBadRequest)
-			return
-		}
-
-		dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-			config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, dbName))
-		if err != nil {
-			http.Error(w, "Error connecting to database: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer dbConn.Close()
-
-		_, err = dbConn.Exec(query)
-
-	case "drop_table":
-		tableName, ok := req["tableName"].(string)
-		if !ok {
-			http.Error(w, "Missing table name in replication request", http.StatusBadRequest)
-			return
-		}
-
-		dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-			config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, dbName))
-		if err != nil {
-			http.Error(w, "Error connecting to database: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer dbConn.Close()
-
-		_, err = dbConn.Exec("DROP TABLE IF EXISTS " + tableName)
-
-	case "link_tables":
-		query, ok := req["query"].(string)
-		if !ok {
-			http.Error(w, "Missing query in replication request", http.StatusBadRequest)
-			return
-		}
-
-		dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-			config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, dbName))
-		if err != nil {
-			http.Error(w, "Error connecting to database: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer dbConn.Close()
-
-		_, err = dbConn.Exec(query)
-
-	case "create", "update", "delete":
-		table, ok := req["table"].(string)
-		if !ok {
-			http.Error(w, "Missing table in replication request", http.StatusBadRequest)
-			return
-		}
-
-		dbConn, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
-			config.MySQL.User, config.MySQL.Password, config.MySQL.Host, config.MySQL.Port, dbName))
-		if err != nil {
-			http.Error(w, "Error connecting to database: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer dbConn.Close()
-
-		data, _ := req["data"].(map[string]interface{})
-		where, _ := req["where"].(map[string]interface{})
-
-		switch operation {
-		case "create":
-			_, err = executeCreate(dbConn, table, data)
-		case "update":
-			_, err = executeUpdate(dbConn, table, data, where)
-		case "delete":
-			_, err = executeDelete(dbConn, table, where)
-		}
-	}
-
-	if err != nil {
-		http.Error(w, "Replication failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(Response{
 		Success: true,
-		Message: "Replication successful",
+		Message: fmt.Sprintf("Slave acknowledged replication signal for operation: %s, data_shardId: %.0f.", operation, shardIDFloat),
 	})
 }
 
+// setupReplicationHandler configures replication for a slave node
 func setupReplicationHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1458,6 +1704,23 @@ func setupReplicationHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func SanitizeDBName(name string) string {
+	// Replace characters not allowed in DB names or simply use a whitelist.
+	// For simplicity, this example is very basic.
+	// In production, use a library or more comprehensive regex.
+	return strings.ReplaceAll(name, "`", "") // Remove backticks at a minimum
+}
+
+// SanitizeIdentifier provides basic sanitization for table and column names.
+func SanitizeIdentifier(name string) string {
+	// Remove backticks and semicolons as a minimal measure.
+	name = strings.ReplaceAll(name, "`", "")
+	name = strings.ReplaceAll(name, ";", "")
+	// Add more replacements or a regex for allowed characters, e.g., /^[a-zA-Z0-9_]+$/
+	return name
+}
+
+// healthCheck checks the server's health
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1486,6 +1749,7 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// electionHandler handles election requests
 func electionHandler(w http.ResponseWriter, r *http.Request) {
 	if currentRole == RoleMaster {
 		w.WriteHeader(http.StatusOK)
@@ -1505,6 +1769,7 @@ func electionHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// newMasterHandler updates the master node information
 func newMasterHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		MasterURL string `json:"masterURL"`
@@ -1547,18 +1812,21 @@ func newMasterHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// sendElectionRequest sends an election request to a node
 func sendElectionRequest(url string) bool {
 	client := http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Post(url+"/api/election", "application/json", nil)
 	return err == nil && resp.StatusCode == http.StatusOK
 }
 
+// sendNewMasterNotification notifies a node of a new master
 func sendNewMasterNotification(url string) {
 	client := http.Client{Timeout: 2 * time.Second}
 	payload := fmt.Sprintf(`{"masterURL": "%s"}`, config.SelfURL)
 	client.Post(url+"/api/new-master", "application/json", strings.NewReader(payload))
 }
 
+// heartbeat periodically checks node health
 func heartbeat() {
 	for {
 		time.Sleep(3 * time.Second)
@@ -1586,6 +1854,7 @@ func heartbeat() {
 	}
 }
 
+// notifyMasterOnline notifies the master that this slave is online
 func notifyMasterOnline() {
 	maxRetries := 3
 	retryDelay := 2 * time.Second
@@ -1604,6 +1873,7 @@ func notifyMasterOnline() {
 	log.Printf("Failed to notify master after %d attempts", maxRetries)
 }
 
+// loggingMiddleware logs HTTP requests
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1613,6 +1883,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsMiddleware adds CORS headers
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1628,74 +1899,152 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func executeCreate(db *sql.DB, table string, data map[string]interface{}) (interface{}, error) {
-	columns := strings.Join(keys(data), ", ")
-	placeholders := strings.Join(createPlaceholders(len(data)), ", ")
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, columns, placeholders)
-
-	values := make([]interface{}, 0, len(data))
-	for _, k := range keys(data) {
-		values = append(values, data[k])
+// executeCreate performs a CREATE operation
+func executeCreate(dbConn *sql.DB, table string, data map[string]interface{}) (interface{}, error) {
+	// Placeholder - Your actual implementation
+	log.Printf("Executing CREATE on table %s with data %+v", table, data)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("no data provided for create operation")
 	}
 
-	result, err := db.Exec(query, values...)
+	var columns []string
+	var placeholders []string
+	var values []interface{}
+
+	for k, v := range data {
+		columns = append(columns, SanitizeIdentifier(k))
+		placeholders = append(placeholders, "?")
+		values = append(values, v)
+	}
+
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		SanitizeIdentifier(table),
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "))
+
+	log.Printf("Executing SQL: %s with values: %v", query, values)
+	res, err := dbConn.Exec(query, values...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("executeCreate failed: %w", err)
 	}
-
-	id, _ := result.LastInsertId()
+	id, _ := res.LastInsertId()
 	return map[string]interface{}{"id": id}, nil
 }
 
-func executeRead(db *sql.DB, table string, where map[string]interface{}) (interface{}, error) {
-	query := fmt.Sprintf("SELECT * FROM %s", table)
-
-	values := make([]interface{}, 0)
-	if where != nil && len(where) > 0 {
-		whereClause, whereValues := buildWhereClause(where)
-		query += " WHERE " + whereClause
-		values = whereValues
+// executeRead performs a READ operation
+func executeRead(dbConn *sql.DB, table string, where map[string]interface{}) (interface{}, error) {
+	// Placeholder - Your actual implementation
+	log.Printf("Executing READ on table %s with where %+v", table, where)
+	query := fmt.Sprintf("SELECT * FROM %s", SanitizeIdentifier(table))
+	var values []interface{}
+	if len(where) > 0 {
+		var conditions []string
+		for k, v := range where {
+			conditions = append(conditions, fmt.Sprintf("%s = ?", SanitizeIdentifier(k)))
+			values = append(values, v)
+		}
+		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	rows, err := db.Query(query, values...)
+	log.Printf("Executing SQL: %s with values: %v", query, values)
+	rows, err := dbConn.Query(query, values...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("executeRead query failed: %w", err)
 	}
 	defer rows.Close()
-
-	return rowsToJSON(rows)
+	// Convert rows to JSON or []map[string]interface{}
+	// This is a simplified version of your rowsToJSON
+	columns, _ := rows.Columns()
+	var results []map[string]interface{}
+	for rows.Next() {
+		rowValues := make([]interface{}, len(columns))
+		rowScanArgs := make([]interface{}, len(columns))
+		for i := range rowValues {
+			rowScanArgs[i] = &rowValues[i]
+		}
+		if err := rows.Scan(rowScanArgs...); err != nil {
+			return nil, fmt.Errorf("executeRead row scan failed: %w", err)
+		}
+		entry := make(map[string]interface{})
+		for i, col := range columns {
+			if b, ok := rowValues[i].([]byte); ok {
+				entry[col] = string(b)
+			} else {
+				entry[col] = rowValues[i]
+			}
+		}
+		results = append(results, entry)
+	}
+	return results, nil
 }
 
-func executeUpdate(db *sql.DB, table string, data map[string]interface{}, where map[string]interface{}) (interface{}, error) {
-	setClause, setValues := buildSetClause(data)
-	whereClause, whereValues := buildWhereClause(where)
-
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, setClause, whereClause)
-
-	values := append(setValues, whereValues...)
-
-	result, err := db.Exec(query, values...)
-	if err != nil {
-		return nil, err
+// executeUpdate performs an UPDATE operation
+func executeUpdate(dbConn *sql.DB, table string, data map[string]interface{}, where map[string]interface{}) (interface{}, error) {
+	// Placeholder - Your actual implementation
+	log.Printf("Executing UPDATE on table %s with data %+v where %+v", table, data, where)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("no data provided for update")
+	}
+	if len(where) == 0 {
+		return nil, fmt.Errorf("no where clause for update; this would update all rows, which is usually unsafe")
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	var setClauses []string
+	var values []interface{}
+	for k, v := range data {
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", SanitizeIdentifier(k)))
+		values = append(values, v)
+	}
+
+	var whereClauses []string
+	for k, v := range where {
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", SanitizeIdentifier(k)))
+		values = append(values, v) // Append where values after set values
+	}
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		SanitizeIdentifier(table),
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+
+	log.Printf("Executing SQL: %s with values: %v", query, values)
+	res, err := dbConn.Exec(query, values...)
+	if err != nil {
+		return nil, fmt.Errorf("executeUpdate failed: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
 	return map[string]interface{}{"rowsAffected": rowsAffected}, nil
 }
 
-func executeDelete(db *sql.DB, table string, where map[string]interface{}) (interface{}, error) {
-	whereClause, whereValues := buildWhereClause(where)
-	query := fmt.Sprintf("DELETE FROM %s WHERE %s", table, whereClause)
-
-	result, err := db.Exec(query, whereValues...)
-	if err != nil {
-		return nil, err
+// executeDelete performs a DELETE operation
+func executeDelete(dbConn *sql.DB, table string, where map[string]interface{}) (interface{}, error) {
+	// Placeholder - Your actual implementation
+	log.Printf("Executing DELETE on table %s where %+v", table, where)
+	if len(where) == 0 {
+		return nil, fmt.Errorf("no where clause for delete; this would delete all rows, which is usually unsafe")
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	var whereClauses []string
+	var values []interface{}
+	for k, v := range where {
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", SanitizeIdentifier(k)))
+		values = append(values, v)
+	}
+
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		SanitizeIdentifier(table),
+		strings.Join(whereClauses, " AND "))
+
+	log.Printf("Executing SQL: %s with values: %v", query, values)
+	res, err := dbConn.Exec(query, values...)
+	if err != nil {
+		return nil, fmt.Errorf("executeDelete failed: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
 	return map[string]interface{}{"rowsAffected": rowsAffected}, nil
 }
 
+// keys returns the keys of a map
 func keys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -1704,6 +2053,7 @@ func keys(m map[string]interface{}) []string {
 	return keys
 }
 
+// createPlaceholders creates a slice of placeholders for SQL queries
 func createPlaceholders(n int) []string {
 	placeholders := make([]string, n)
 	for i := range placeholders {
@@ -1712,6 +2062,7 @@ func createPlaceholders(n int) []string {
 	return placeholders
 }
 
+// buildSetClause builds the SET clause for UPDATE queries
 func buildSetClause(data map[string]interface{}) (string, []interface{}) {
 	clauses := make([]string, 0, len(data))
 	values := make([]interface{}, 0, len(data))
@@ -1724,6 +2075,7 @@ func buildSetClause(data map[string]interface{}) (string, []interface{}) {
 	return strings.Join(clauses, ", "), values
 }
 
+// buildWhereClause builds the WHERE clause for queries
 func buildWhereClause(where map[string]interface{}) (string, []interface{}) {
 	if where == nil || len(where) == 0 {
 		return "1=1", []interface{}{}
@@ -1740,6 +2092,7 @@ func buildWhereClause(where map[string]interface{}) (string, []interface{}) {
 	return strings.Join(clauses, " AND "), values
 }
 
+// rowsToJSON converts SQL rows to JSON
 func rowsToJSON(rows *sql.Rows) ([]map[string]interface{}, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -1777,6 +2130,7 @@ func rowsToJSON(rows *sql.Rows) ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// shutdownSlaveHandler shuts down a slave node
 func shutdownSlaveHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1832,6 +2186,7 @@ func shutdownSlaveHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// shutdownHandler initiates a graceful shutdown
 func shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1864,7 +2219,7 @@ func shutdownHandler(w http.ResponseWriter, r *http.Request) {
 
 	response := Response{
 		Success: true,
-		Message: "Computer shutdown initiated",
+		Message: "Shutdown initiated",
 	}
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to send shutdown response: %v", err)
@@ -1896,6 +2251,7 @@ func shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// slaveOnlineHandler updates the status of a slave node coming online
 func slaveOnlineHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -1966,4 +2322,88 @@ func slaveOnlineHandler(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Message: fmt.Sprintf("Slave %s online status updated", req.SlaveURL),
 	})
+}
+
+func forwardRequestToMaster(w http.ResponseWriter, r *http.Request) {
+	if state.CurrentMaster == "" {
+		log.Printf("Error: Cannot forward request, master URL is not set.")
+		http.Error(w, "Master node not available", http.StatusInternalServerError)
+		return
+	}
+	if state.CurrentMaster == config.SelfURL {
+		log.Printf("Error: Cannot forward request, this node IS the master.")
+		// This case should ideally be caught before calling forwardRequestToMaster
+		http.Error(w, "This node is the master, cannot forward to self", http.StatusInternalServerError)
+		return
+	}
+
+	// Read the original request body
+	originalBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading original request body for forwarding: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+	// It's crucial to restore the request body so it can be read again by the HTTP client
+	r.Body = io.NopCloser(bytes.NewBuffer(originalBody))
+
+	// Construct the target URL on the master
+	// r.URL.Path should already contain the correct API endpoint like "/api/crud"
+	targetURL := state.CurrentMaster + r.URL.Path
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	log.Printf("Forwarding request from slave (%s) to master (%s): %s %s", config.SelfURL, state.CurrentMaster, r.Method, targetURL)
+
+	// Create a new request to the master.
+	// Use a new buffer for the master request body.
+	masterReq, err := http.NewRequest(r.Method, targetURL, bytes.NewBuffer(originalBody))
+	if err != nil {
+		log.Printf("Error creating request to master: %v", err)
+		http.Error(w, "Failed to create request for master", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy headers from the original request to the new master request
+	for name, headers := range r.Header {
+		for _, h := range headers {
+			masterReq.Header.Add(name, h)
+		}
+	}
+	// Ensure Content-Type is set if there's a body, especially for POST/PUT
+	if len(originalBody) > 0 && masterReq.Header.Get("Content-Type") == "" {
+		// Prefer original Content-Type if available, otherwise default to application/json
+		originalContentType := r.Header.Get("Content-Type")
+		if originalContentType != "" {
+			masterReq.Header.Set("Content-Type", originalContentType)
+		} else {
+			masterReq.Header.Set("Content-Type", "application/json")
+		}
+	}
+
+	// Send the request to the master
+	client := &http.Client{Timeout: 30 * time.Second} // Adjust timeout as needed
+	resp, err := client.Do(masterReq)
+	if err != nil {
+		log.Printf("Error forwarding request to master %s: %v", targetURL, err)
+		http.Error(w, fmt.Sprintf("Failed to forward request to master: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy the master's response headers and status code back to the original client
+	for name, headers := range resp.Header {
+		for _, h := range headers {
+			w.Header().Add(name, h)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy the master's response body back to the original client
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("Error copying response body from master: %v", err)
+		// Don't write an error header here as it might already be sent
+	}
+	log.Printf("Successfully forwarded request to master and relayed response (status: %d)", resp.StatusCode)
 }

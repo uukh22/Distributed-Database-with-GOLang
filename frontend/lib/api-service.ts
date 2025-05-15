@@ -1,4 +1,5 @@
-const API_BASE_URL = "http://localhost:8080/api"
+// Update the API_BASE_URL to be configurable
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"
 
 export interface ApiResponse<T = any> {
   success: boolean
@@ -23,6 +24,8 @@ export interface Database {
 export interface Table {
   name: string
   columns: Column[]
+  shardId: number
+  shardKey: string
 }
 
 export interface Column {
@@ -93,10 +96,20 @@ class ApiService {
     return this.request<Table[]>(`/list-tables?db=${dbName}`)
   }
 
-  async createTable(dbName: string, tableName: string, columns: Record<string, string>): Promise<ApiResponse> {
+  async createTable(
+    dbName: string,
+    tableName: string,
+    columns: Record<string, string>,
+    shardId?: number,
+  ): Promise<ApiResponse> {
     return this.request("/create-table", {
       method: "POST",
-      body: JSON.stringify({ dbName, tableName, columns }),
+      body: JSON.stringify({
+        dbName,
+        tableName,
+        columns,
+        shardId: shardId || this.calculateShardId(dbName + "." + tableName),
+      }),
     })
   }
 
@@ -122,17 +135,39 @@ class ApiService {
   }
 
   // CRUD operations
-  async createRecord(dbName: string, table: string, data: Record<string, any>): Promise<ApiResponse> {
+  async createRecord(
+    dbName: string,
+    table: string,
+    data: Record<string, any>,
+    shardKeyValue?: any,
+  ): Promise<ApiResponse> {
     return this.request("/crud", {
       method: "POST",
-      body: JSON.stringify({ dbName, operation: "create", table, data }),
+      body: JSON.stringify({
+        dbName,
+        operation: "create",
+        table,
+        data,
+        shardKeyValue,
+      }),
     })
   }
 
-  async readRecords(dbName: string, table: string, where?: Record<string, any>): Promise<ApiResponse> {
+  async readRecords(
+    dbName: string,
+    table: string,
+    where?: Record<string, any>,
+    shardKeyValue?: any,
+  ): Promise<ApiResponse> {
     return this.request("/crud", {
       method: "POST",
-      body: JSON.stringify({ dbName, operation: "read", table, where }),
+      body: JSON.stringify({
+        dbName,
+        operation: "read",
+        table,
+        where,
+        shardKeyValue,
+      }),
     })
   }
 
@@ -141,17 +176,49 @@ class ApiService {
     table: string,
     data: Record<string, any>,
     where: Record<string, any>,
+    shardKeyValue?: any,
   ): Promise<ApiResponse> {
     return this.request("/crud", {
       method: "POST",
-      body: JSON.stringify({ dbName, operation: "update", table, data, where }),
+      body: JSON.stringify({
+        dbName,
+        operation: "update",
+        table,
+        data,
+        where,
+        shardKeyValue,
+      }),
     })
   }
 
-  async deleteRecords(dbName: string, table: string, where: Record<string, any>): Promise<ApiResponse> {
+  async deleteRecords(
+    dbName: string,
+    table: string,
+    where: Record<string, any>,
+    shardKeyValue?: any,
+  ): Promise<ApiResponse> {
     return this.request("/crud", {
       method: "POST",
-      body: JSON.stringify({ dbName, operation: "delete", table, where }),
+      body: JSON.stringify({
+        dbName,
+        operation: "delete",
+        table,
+        where,
+        shardKeyValue,
+      }),
+    })
+  }
+
+  // Update the fetchRecords function to handle shard-specific reads on slave nodes
+  async fetchRecordsForShard(dbName: string, tableName: string, shardId: number): Promise<ApiResponse> {
+    return this.request("/crud", {
+      method: "POST",
+      body: JSON.stringify({
+        dbName,
+        operation: "read",
+        table: tableName,
+        shardId: shardId, // Explicitly specify the shard ID
+      }),
     })
   }
 
@@ -176,6 +243,15 @@ class ApiService {
       method: "POST",
       body: JSON.stringify({ slaveURL }),
     })
+  }
+
+  // Helper method to calculate shardId (matching the Go backend logic)
+  calculateShardId(key: string, shardCount = 3): number {
+    let hash = 0
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash * 31 + key.charCodeAt(i)) % shardCount
+    }
+    return (hash & 0x7fffffff) % shardCount
   }
 }
 
