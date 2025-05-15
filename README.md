@@ -158,8 +158,8 @@ You can explore and test all backend API endpoints via Postman: [Postman Documen
 
 ## License
 
-This project is a **project** for the **Distributed Database** course. 
-It was developed under the supervision of **Dr. Ibrahim El-Awady** and **TA Fares Ahmed Diab**.&#x20;
+* This project is a **project** for the **Distributed Database** course. 
+* It was developed under the supervision of **Dr. Ibrahim El-Awady** and **TA Fares Ahmed Diab**.&#x20;
 
 ---
 
