@@ -38,5 +38,5 @@ A professional frontend interface for managing a distributed database system bui
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/distributed-db-frontend.git
+   git clone https://github.com/uukh2/distributed-db-frontend.git
    cd distributed-db-frontend
