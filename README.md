@@ -165,6 +165,7 @@ This project is a **project** for the **Distributed Database** course. It was 
 ---
 
 ## Architecture
+
 ![DDB-management.jpg](./backend/DDB-management.jpg)
 
 ![Fault-tolerance.jpg](./backend/Fault-tolerance.jpg)
