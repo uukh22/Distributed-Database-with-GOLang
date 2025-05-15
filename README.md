@@ -168,7 +168,11 @@ This project is a **project** for the **Distributed Database** course. It was 
 
 ![Fault-tolerance.jpg](./backend/Fault%20tolerance.jpg)
 
-![Fault-tolerance.mp4](./backend/Fault%20tolerance.mp4)
+
+<video width="600" controls>
+  <source src="./backend/Fault%20tolerance.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 
 ---
 
