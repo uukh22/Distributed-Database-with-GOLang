@@ -47,7 +47,9 @@ export default function TablesPage() {
 
   // New table form state
   const [newTableName, setNewTableName] = useState("")
-  const [columns, setColumns] = useState<{ name: string; type: string }[]>([{ name: "id", type: "INT AUTO_INCREMENT" }])
+  const [columns, setColumns] = useState<{ name: string; type: string }[]>([
+    { name: "id", type: "INT AUTO_INCREMENT PRIMARY KEY" },
+  ])
 
   // Link tables form state
   const [sourceTable, setSourceTable] = useState("")
@@ -55,6 +57,10 @@ export default function TablesPage() {
   const [sourceColumn, setSourceColumn] = useState("")
   const [targetColumn, setTargetColumn] = useState("")
   const [constraintType, setConstraintType] = useState("RESTRICT")
+
+  // Add a new state for selected shard ID
+  const [selectedShardId, setSelectedShardId] = useState<number>(0)
+  const [availableShards, setAvailableShards] = useState<number[]>([0, 1, 2]) // Default to 3 shards (0, 1, 2)
 
   const fetchTables = async () => {
     if (!dbName) return
@@ -88,9 +94,27 @@ export default function TablesPage() {
     }
   }
 
+  // Update the useEffect that fetches node information to also get shard count
   useEffect(() => {
     if (dbName) {
       fetchTables()
+
+      // Get node information and available shards
+      const fetchNodeInfo = async () => {
+        try {
+          const nodesResponse = await apiService.getNodes()
+          if (nodesResponse.success && nodesResponse.result) {
+            // Find the maximum shard ID to determine how many shards are available
+            const maxShardId = Math.max(...nodesResponse.result.map((node) => node.shardId))
+            const shards = Array.from({ length: maxShardId + 1 }, (_, i) => i)
+            setAvailableShards(shards)
+          }
+        } catch (error) {
+          console.error("Failed to fetch node information:", error)
+        }
+      }
+
+      fetchNodeInfo()
     }
   }, [dbName])
 
@@ -112,7 +136,7 @@ export default function TablesPage() {
     }
   }
 
-  // Update the createTable function to handle the new API structure
+  // Update the handleCreateTable function to use the selected shard ID
   const handleCreateTable = async () => {
     if (!dbName) return
 
@@ -143,32 +167,46 @@ export default function TablesPage() {
       columnsObj[col.name] = col.type
     })
 
-    try {
-      // Calculate a shardId for the table based on dbName and tableName
-      const shardId = Math.floor(Math.random() * 3) // Simple random shard assignment (0-2)
+    // Show a loading toast
+    toast({
+      title: "Creating table...",
+      description: "Please wait while we create your table",
+    })
 
-      const response = await apiService.createTable(dbName, newTableName, columnsObj, shardId)
+    console.log("Creating table with data:", {
+      dbName,
+      tableName: newTableName,
+      columns: columnsObj,
+      shardId: selectedShardId,
+    })
+
+    try {
+      // Use the selected shard ID instead of calculating it
+      const response = await apiService.createTable(dbName, newTableName, columnsObj, selectedShardId)
+      console.log("Create table response:", response)
+
       if (response.success) {
         toast({
           title: "Success",
           description: response.message || "Table created successfully",
         })
         setNewTableName("")
-        setColumns([{ name: "id", type: "INT AUTO_INCREMENT" }])
+        setColumns([{ name: "id", type: "INT AUTO_INCREMENT PRIMARY KEY" }])
         setCreateDialogOpen(false)
         fetchTables()
       } else {
         toast({
           variant: "destructive",
           title: "Error",
-          description: response.message || "Failed to create table",
+          description: response.message || "Failed to create table. Check console for details.",
         })
       }
     } catch (error) {
+      console.error("Error creating table:", error)
       toast({
         variant: "destructive",
         title: "Error",
-        description: "An error occurred while creating the table",
+        description: error instanceof Error ? error.message : "An unknown error occurred while creating the table",
       })
     }
   }
@@ -241,6 +279,15 @@ export default function TablesPage() {
         description: "An error occurred while linking tables",
       })
     }
+  }
+
+  // Add the calculateShardId function to match the backend's algorithm
+  const calculateShardId = (key: string, shardCount = 3): number => {
+    let hash = 0
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash * 31 + key.charCodeAt(i)) % shardCount
+    }
+    return (hash & 0x7fffffff) % shardCount
   }
 
   if (!dbName) {
@@ -423,6 +470,29 @@ export default function TablesPage() {
                         onChange={(e) => setNewTableName(e.target.value)}
                         placeholder="Enter table name"
                       />
+                    </div>
+
+                    <div className="grid gap-2">
+                      <Label htmlFor="shardId">Shard ID</Label>
+                      <Select
+                        value={selectedShardId.toString()}
+                        onValueChange={(value) => setSelectedShardId(Number.parseInt(value))}
+                      >
+                        <SelectTrigger id="shardId">
+                          <SelectValue placeholder="Select shard ID" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {availableShards.map((shardId) => (
+                            <SelectItem key={shardId} value={shardId.toString()}>
+                              Shard {shardId}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        Select the shard where this table will be created. Tables in the same shard can be joined more
+                        efficiently.
+                      </p>
                     </div>
 
                     <div className="grid gap-2">

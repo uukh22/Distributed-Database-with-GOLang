@@ -96,21 +96,57 @@ class ApiService {
     return this.request<Table[]>(`/list-tables?db=${dbName}`)
   }
 
+  // Update the createTable function to handle the column definitions better
   async createTable(
     dbName: string,
     tableName: string,
     columns: Record<string, string>,
-    shardId?: number,
+    shardId: number,
   ): Promise<ApiResponse> {
-    return this.request("/create-table", {
-      method: "POST",
-      body: JSON.stringify({
-        dbName,
-        tableName,
-        columns,
-        shardId: shardId || this.calculateShardId(dbName + "." + tableName),
-      }),
-    })
+    // Convert columns object to a comma-separated string of column definitions
+    const columnDefinitions = Object.entries(columns)
+      .map(([name, type]) => `${name} ${type}`)
+      .join(", ")
+
+    // Create URL with query parameters as expected by the backend
+    const url = `${API_BASE_URL}/create-table?db=${encodeURIComponent(dbName)}&name=${encodeURIComponent(tableName)}&shard_id=${shardId}&columns=${encodeURIComponent(columnDefinitions)}`
+
+    console.log("Creating table with URL:", url) // Debug log
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      })
+
+      const text = await response.text()
+      console.log("Create table response:", text) // Debug log
+
+      // Try to parse the response as JSON if possible
+      let result
+      try {
+        result = JSON.parse(text)
+        return {
+          success: response.ok,
+          message: result.message || text,
+          result: result.result,
+        }
+      } catch (e) {
+        // If not JSON, return the text
+        return {
+          success: response.ok,
+          message: text,
+        }
+      }
+    } catch (error) {
+      console.error("API request failed:", error)
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : "Unknown error occurred",
+      }
+    }
   }
 
   async dropTable(dbName: string, tableName: string): Promise<ApiResponse> {
