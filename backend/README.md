@@ -77,7 +77,7 @@ Create a `config.json` with the following:
 3. **Run node:**
 
    ```bash
-   go run main.go
+   go run .
    ```
 4. **Override config (optional):**
 
