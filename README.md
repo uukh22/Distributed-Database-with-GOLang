@@ -76,7 +76,7 @@ This project is a **Golang-based distributed database system** with a profession
 3. Start the node:
 
    ```bash
-   go run main.go
+   go run .
    ```
 
 ### Frontend Setup
