@@ -179,3 +179,8 @@ Crafted with care by:
 * **Mohamed Abdelmawla**
 
 Contributions, feedback, and pull requests are welcome!
+
+---
+## Demo in LinkedIn
+
+Demo for Master/Slaves: [Demo](https://www.linkedin.com/posts/uukh2_golang-nextjs-distributedsystems-activity-7329917795092135937-GmVg?utm_source=share&utm_medium=member_desktop&rcm=ACoAADzpuTkBRafJKBr464Bo8wksxxPDVxyx2C0)
